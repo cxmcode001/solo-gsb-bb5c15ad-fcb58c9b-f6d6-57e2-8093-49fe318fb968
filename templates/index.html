@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>乐谱反复段展开工具</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    background: #f5f6f8;
+    color: #24292f;
+  }
+  .container { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 4px; }
+  .hint { color: #57606a; font-size: 14px; line-height: 1.7; margin: 8px 0 16px; }
+  .hint code {
+    background: #eaeef2; border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  textarea {
+    width: 100%; padding: 10px 12px; font-size: 15px; line-height: 1.6;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border: 1px solid #d0d7de; border-radius: 8px; resize: vertical;
+    background: #fff;
+  }
+  textarea:focus { outline: 2px solid #0969da33; border-color: #0969da; }
+  .toolbar { display: flex; gap: 8px; margin: 12px 0 16px; flex-wrap: wrap; }
+  .toolbar input {
+    padding: 8px 12px; font-size: 14px; width: 150px;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #fff;
+  }
+  .toolbar input:focus { outline: 2px solid #0969da33; border-color: #0969da; }
+  button {
+    padding: 8px 18px; font-size: 14px; border: 1px solid #d0d7de;
+    border-radius: 8px; background: #fff; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #f0f2f5; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1a5fd0; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #errors ul {
+    margin: 0 0 16px; padding: 12px 16px 12px 32px;
+    background: #ffebe9; border: 1px solid #ffb3ad; border-radius: 8px;
+    color: #a40e26; font-size: 14px; line-height: 1.8;
+  }
+  #summary, #beatSummary, #segmentSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  #metroStatus { font-size: 14px; color: #57606a; align-self: center; }
+  table {
+    width: 100%; border-collapse: collapse; background: #fff;
+    border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
+    font-size: 14px;
+  }
+  th, td { padding: 7px 14px; text-align: right; border-bottom: 1px solid #eaeef2; }
+  th { background: #f0f2f5; font-weight: 600; }
+  tbody tr:nth-child(even) { background: #fafbfc; }
+  tbody tr:hover { background: #eef4ff; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>乐谱反复段展开工具</h1>
+  <p class="hint">
+    每行输入一个小节编号；编号前加 <code>|:</code> 表示反复起点，编号后加
+    <code>:|xN</code>（N 为 2~9）表示反复终点，反复段可嵌套。
+    行末可附 <code>[拍数@BPM]</code> 或 <code>[拍数]</code>：拍数默认 4，初始速度
+    120 BPM，未标速度的小节沿用上一演奏小节的速度；起止时间单位为毫秒。
+    展开结果超过 5000 小节时将停止并指出导致超限的源行。
+  </p>
+  <textarea id="input" rows="12" spellcheck="false"
+    placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
+  <p class="hint">
+    临时变速（可选）：每行一条 <code>演奏序号=BPM</code>，展开与拍点查询共用。
+    演奏序号按反复展开后的实际轮次计数，BPM 为正整数；演奏到该轮次时临时速度优先于
+    该小节原谱速度，并沿用至后续未标速小节，遇到下一处原谱显式速度或下一条临时变速时重新切换。
+    序号重复、超出展开范围或格式错误时会指出方案内的行号。
+  </p>
+  <textarea id="tempo" rows="3" spellcheck="false"
+    placeholder="例如：&#10;11=90&#10;16=120"></textarea>
+  <div class="toolbar">
+    <button id="expandBtn" class="primary">展开</button>
+    <button id="exampleBtn">填入示例</button>
+    <button id="clearBtn">清空</button>
+    <button id="csvBtn" disabled>下载 CSV</button>
+  </div>
+  <div id="errors"></div>
+  <p id="summary"></p>
+  <table id="result" hidden>
+    <thead>
+      <tr><th>演奏序号</th><th>原小节编号</th><th>源行号</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>实时节拍器</h2>
+  <p class="hint">
+    以当前乐谱和临时变速方案从头（演奏时间 0 毫秒）播放节拍：每小节首拍为高音，其余拍为低音。
+    拍点由 Web Audio 音频时钟预排程，滚动按左闭右开的短时间窗向服务器取拍，
+    并按演奏序号与拍序去重，跨窗口与反复回跳不漏拍、不重拍。
+    停止、修改乐谱或变速方案会取消尚未发声的拍点；播放到曲终自动停止。
+  </p>
+  <div class="toolbar">
+    <button id="metroBtn" class="primary">播放节拍器</button>
+    <span id="metroStatus"></span>
+  </div>
+
+  <h2>节拍点查询</h2>
+  <p class="hint">
+    输入起止毫秒，列出时间窗内每一拍的时间、演奏序号、原小节编号、拍序与首拍标记。
+    时间窗按左闭右开 <code>[起始, 结束)</code> 处理；落窗判断使用未取整的累计时间，
+    展示毫秒四舍五入到最近毫秒。窗内拍点超过 5000 时停止并指出对应源行。
+  </p>
+  <div class="toolbar">
+    <input id="startMs" type="number" min="0" step="any" placeholder="起始毫秒（含）">
+    <input id="endMs" type="number" min="0" step="any" placeholder="结束毫秒（不含）">
+    <button id="beatsBtn" class="primary">查询拍点</button>
+  </div>
+  <p id="beatSummary"></p>
+  <table id="beatResult" hidden>
+    <thead>
+      <tr><th>时间(毫秒)</th><th>演奏序号</th><th>原小节编号</th><th>拍序</th><th>首拍</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>排练片段定位</h2>
+  <p class="hint">
+    输入起止原谱小节编号，范围按源谱输入顺序确定（端点须存在且起点不得晚于终点），
+    列出该范围在实际演奏中每次被完整、连续奏出的片段：起止演奏序号、起止毫秒与时长。
+    一次匹配必须逐小节遵循源谱顺序，反复回跳或内层反复插入额外小节时不能拼接成片段；
+    时间规则与展开一致，临时变速按演奏序号生效。
+  </p>
+  <div class="toolbar">
+    <input id="startNum" type="number" min="0" step="1" placeholder="起点原谱小节编号">
+    <input id="endNum" type="number" min="0" step="1" placeholder="终点原谱小节编号">
+    <button id="segmentsBtn" class="primary">定位片段</button>
+  </div>
+  <p id="segmentSummary"></p>
+  <table id="segmentResult" hidden>
+    <thead>
+      <tr><th>起始演奏序号</th><th>结束演奏序号</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th><th>时长(毫秒)</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastRows = [];
+
+$("expandBtn").addEventListener("click", doExpand);
+$("clearBtn").addEventListener("click", () => {
+  stopMetronome();
+  $("input").value = "";
+  $("tempo").value = "";
+  reset();
+  $("input").focus();
+});
+$("exampleBtn").addEventListener("click", () => {
+  stopMetronome();
+  $("input").value = ["1[4@120]", "2", "|:3", "4[2]", "|:5", "6:|x3", "7:|x2[4@90]", "8"].join("\n");
+  doExpand();
+});
+$("csvBtn").addEventListener("click", downloadCsv);
+$("beatsBtn").addEventListener("click", doBeatQuery);
+for (const id of ["startMs", "endMs"]) {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doBeatQuery(); });
+}
+$("segmentsBtn").addEventListener("click", doSegmentQuery);
+for (const id of ["startNum", "endNum"]) {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doSegmentQuery(); });
+}
+
+// ---- 实时节拍器 ----
+// 滚动取拍窗口（左闭右开）、预排程视界与排程定时器间隔（毫秒）
+const METRO_WINDOW_MS = 500;
+const METRO_LOOKAHEAD_MS = 600;
+const METRO_TICK_MS = 50;
+// 首拍高音，其余拍低音
+const METRO_FIRST_HZ = 880;
+const METRO_OTHER_HZ = 440;
+
+const metro = {
+  playing: false,
+  ctx: null,            // 音频上下文；停止时关闭，未发声的排程随之取消
+  timer: null,          // 排程定时器
+  generation: 0,        // 会话代际：停止或修改后递增，过期响应不再排程
+  cursor: 0,            // 下一待请求窗口的起始毫秒（演奏时间轴）
+  total: 0,             // 全曲总时长（毫秒）
+  startAt: 0,           // 演奏时间 0 对应的音频时钟时刻
+  fetching: false,      // 是否有拍点窗口请求在途
+  scheduled: new Set(), // 已排程拍点键（"演奏序号:拍序"），跨窗口去重
+  sources: new Set(),   // 已排程未结束的音频节点
+};
+
+$("metroBtn").addEventListener("click", () => {
+  if (metro.playing) stopMetronome();
+  else startMetronome();
+});
+// 修改乐谱或临时变速方案时停止播放，取消尚未发声的拍点
+for (const id of ["input", "tempo"]) {
+  $(id).addEventListener("input", () => { if (metro.playing) stopMetronome(); });
+}
+
+async function startMetronome() {
+  stopMetronome();  // 清理可能存在的上一会话
+  const gen = metro.generation;
+  metro.playing = true;
+  $("errors").innerHTML = "";
+  updateMetroUI("正在获取展开结果…");
+
+  // 展开接口：校验当前乐谱与临时变速方案，并取全曲总时长
+  let data;
+  try {
+    const resp = await fetch("/api/expand", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value, tempo: $("tempo").value }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    data = null;
+  }
+  if (gen !== metro.generation) return;  // 已停止或乐谱已修改
+  if (!data) {
+    showErrors([{ line: null, message: "节拍器请求失败：无法连接服务器" }]);
+    stopMetronome();
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    stopMetronome();
+    return;
+  }
+  const total = data.rows.length ? data.rows[data.rows.length - 1].end_ms : 0;
+  if (total <= 0) {
+    showErrors([{ line: null, message: "乐谱总时长为 0，无法播放" }]);
+    stopMetronome();
+    return;
+  }
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    showErrors([{ line: null, message: "当前浏览器不支持 Web Audio API，无法播放节拍器" }]);
+    stopMetronome();
+    return;
+  }
+  const ctx = new AudioCtx();
+  metro.ctx = ctx;
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch (e) { /* 忽略，继续尝试播放 */ }
+  }
+  if (gen !== metro.generation) {  // await 期间被停止或乐谱已修改
+    if (metro.ctx === ctx) metro.ctx = null;
+    ctx.close().catch(() => {});
+    return;
+  }
+  metro.total = total;
+  metro.cursor = 0;
+  // 演奏时间 0 映射到稍后的音频时刻，为首个拍点窗口请求留出时间
+  metro.startAt = ctx.currentTime + 0.15;
+  metro.timer = setInterval(metroTick, METRO_TICK_MS);
+  metroTick();
+}
+
+function stopMetronome(status) {
+  const wasActive = metro.playing || metro.ctx || metro.timer;
+  metro.generation++;  // 使在途的展开/拍点请求过期，响应到达时不再排程
+  metro.playing = false;
+  if (metro.timer) { clearInterval(metro.timer); metro.timer = null; }
+  // 取消尚未发声的拍点
+  for (const src of metro.sources) {
+    try { src.stop(); } catch (e) { /* 节点已结束 */ }
+  }
+  metro.sources.clear();
+  if (metro.ctx) { metro.ctx.close().catch(() => {}); metro.ctx = null; }
+  metro.scheduled.clear();
+  metro.fetching = false;
+  metro.cursor = 0;
+  metro.total = 0;
+  if (wasActive) updateMetroUI(status || "已停止");
+}
+
+function metroTick() {
+  if (!metro.playing || !metro.ctx) return;
+  const now = metro.ctx.currentTime;
+  const horizon = (now - metro.startAt) * 1000 + METRO_LOOKAHEAD_MS;
+  if (metro.cursor < metro.total && metro.cursor < horizon && !metro.fetching) {
+    fetchMetroWindow();
+  }
+  if (metro.cursor >= metro.total && !metro.fetching) {
+    // 全部拍点已排程：曲终（含尾音）后自动停止
+    if (now >= metro.startAt + metro.total / 1000 + 0.2) {
+      stopMetronome("播放结束，已自动停止");
+      return;
+    }
+  }
+  const pos = Math.max(0, Math.min(metro.total, Math.round((now - metro.startAt) * 1000)));
+  updateMetroUI(`播放中：${pos} / ${metro.total} 毫秒`);
+}
+
+async function fetchMetroWindow() {
+  const gen = metro.generation;
+  const ctx = metro.ctx;
+  const start = metro.cursor;
+  const end = Math.min(start + METRO_WINDOW_MS, metro.total);  // 左闭右开 [start, end)
+  metro.fetching = true;
+  let data;
+  try {
+    const resp = await fetch("/api/beats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        tempo: $("tempo").value,
+        start_ms: start,
+        end_ms: end,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    data = null;
+  }
+  if (gen !== metro.generation || !metro.playing) return;  // 过期请求不再排程
+  metro.fetching = false;
+  if (!data) {
+    showErrors([{ line: null, message: "节拍器请求失败：无法连接服务器" }]);
+    stopMetronome();
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    stopMetronome();
+    return;
+  }
+  metro.cursor = end;  // 窗口首尾相接，下一窗口从 end 开始
+  for (const b of data.beats) {
+    const key = b.seq + ":" + b.beat;  // 按演奏序号与拍序去重
+    if (metro.scheduled.has(key)) continue;
+    metro.scheduled.add(key);
+    scheduleClick(ctx, b);
+  }
+  metroTick();  // 继续预排程后续窗口
+}
+
+function scheduleClick(ctx, beat) {
+  // 拍点对应的音频时刻；迟到的拍点立即发声，不错过任何一拍
+  const when = Math.max(metro.startAt + beat.time_ms / 1000, ctx.currentTime);
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = beat.first ? METRO_FIRST_HZ : METRO_OTHER_HZ;
+  gain.gain.setValueAtTime(0.0001, when);
+  gain.gain.exponentialRampToValueAtTime(0.6, when + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, when + 0.12);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(when);
+  osc.stop(when + 0.15);
+  metro.sources.add(osc);
+  osc.onended = () => {
+    metro.sources.delete(osc);
+    osc.disconnect();
+    gain.disconnect();
+  };
+}
+
+function updateMetroUI(status) {
+  $("metroBtn").textContent = metro.playing ? "停止" : "播放节拍器";
+  $("metroStatus").textContent = status;
+}
+
+function reset() {
+  $("errors").innerHTML = "";
+  resetExpand();
+  resetBeats();
+  resetSegments();
+}
+
+function resetExpand() {
+  $("summary").textContent = "";
+  $("result").hidden = true;
+  $("result").querySelector("tbody").innerHTML = "";
+  $("csvBtn").disabled = true;
+  lastRows = [];
+}
+
+function resetBeats() {
+  $("beatSummary").textContent = "";
+  $("beatResult").hidden = true;
+  $("beatResult").querySelector("tbody").innerHTML = "";
+}
+
+function resetSegments() {
+  $("segmentSummary").textContent = "";
+  $("segmentResult").hidden = true;
+  $("segmentResult").querySelector("tbody").innerHTML = "";
+}
+
+async function doExpand() {
+  reset();
+  let data;
+  try {
+    const resp = await fetch("/api/expand", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value, tempo: $("tempo").value }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  lastRows = data.rows;
+  const total = data.rows.length ? data.rows[data.rows.length - 1].end_ms : 0;
+  $("summary").textContent = `展开成功，共 ${data.count} 小节，总时长 ${total} 毫秒`;
+  const tbody = $("result").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const r of data.rows) {
+    const tr = document.createElement("tr");
+    for (const v of [r.seq, r.num, r.line, r.start_ms, r.end_ms]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("result").hidden = false;
+  $("csvBtn").disabled = false;
+}
+
+function showErrors(errors) {
+  const ul = document.createElement("ul");
+  for (const e of errors) {
+    const li = document.createElement("li");
+    // 带 source 的错误（如临时变速方案）行号指对应输入区内的行号
+    const where = e.line ? `${e.source ? e.source : ""}第 ${e.line} 行` : (e.source || "");
+    li.textContent = where ? `${where}：${e.message}` : e.message;
+    ul.appendChild(li);
+  }
+  $("errors").appendChild(ul);
+}
+
+async function doBeatQuery() {
+  $("errors").innerHTML = "";
+  resetBeats();
+  // 空值或非数字（NaN 经 JSON 序列化也为 null）交由服务端校验
+  const toNum = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  let data;
+  try {
+    const resp = await fetch("/api/beats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        start_ms: toNum("startMs"),
+        end_ms: toNum("endMs"),
+        tempo: $("tempo").value,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  $("beatSummary").textContent = data.count
+    ? `时间窗内共 ${data.count} 拍`
+    : "时间窗内没有拍点";
+  if (!data.count) return;
+  const tbody = $("beatResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const b of data.beats) {
+    const tr = document.createElement("tr");
+    for (const v of [b.time_ms, b.seq, b.num, b.beat, b.first ? "✓" : ""]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("beatResult").hidden = false;
+}
+
+async function doSegmentQuery() {
+  $("errors").innerHTML = "";
+  resetSegments();
+  // 空值或非数字（NaN 经 JSON 序列化也为 null）交由服务端校验
+  const toNum = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  let data;
+  try {
+    const resp = await fetch("/api/segments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        start_num: toNum("startNum"),
+        end_num: toNum("endNum"),
+        tempo: $("tempo").value,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  $("segmentSummary").textContent = data.count
+    ? `源谱范围 ${data.pattern.join(" ")} 共定位到 ${data.count} 个片段`
+    : `源谱范围 ${data.pattern.join(" ")} 在实际演奏中没有完整、连续奏出的片段`;
+  if (!data.count) return;
+  const tbody = $("segmentResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const s of data.segments) {
+    const tr = document.createElement("tr");
+    for (const v of [s.start_seq, s.end_seq, s.start_ms, s.end_ms, s.duration_ms]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("segmentResult").hidden = false;
+}
+
+function downloadCsv() {
+  const lines = ["演奏序号,原小节编号,源行号,起始时间(毫秒),结束时间(毫秒)"];
+  for (const r of lastRows) lines.push(`${r.seq},${r.num},${r.line},${r.start_ms},${r.end_ms}`);
+  // 加 BOM 以便 Excel 正确识别 UTF-8 中文表头
+  const blob = new Blob(["﻿" + lines.join("\r\n") + "\r\n"],
+    { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "expanded_measures.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
