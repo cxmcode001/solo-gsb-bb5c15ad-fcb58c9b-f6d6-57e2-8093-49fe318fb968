@@ -17,6 +17,7 @@
 
 import math
 import re
+import struct
 
 # 展开小节数上限
 MAX_MEASURES = 5000
@@ -24,9 +25,24 @@ MAX_MEASURES = 5000
 # 时间窗内拍点数上限
 MAX_BEATS = 5000
 
+# MIDI 导出的全曲总拍数上限
+MAX_TOTAL_BEATS = 5000
+
 # 默认拍数与初始速度
 DEFAULT_BEATS = 4
 INITIAL_BPM = 120
+
+# MIDI 导出参数：单轨 SMF 格式 0，480 ticks/拍；每拍一个四分音符
+MIDI_TICKS_PER_BEAT = 480
+MIDI_NOTE_TICKS = 120
+MIDI_CHANNEL = 9  # 通道号 0 基，MIDI 第 10 通道（打击乐）
+MIDI_VELOCITY = 100
+MIDI_NOTE_FIRST = 76   # 每小节首拍
+MIDI_NOTE_OTHER = 77   # 其余各拍
+
+# MIDI 速度事件（Set Tempo）的微秒/拍为三字节正整数的上下限
+TEMPO_US_MIN = 1
+TEMPO_US_MAX = 0xFFFFFF
 
 # 行格式：可选的 |: 前缀 + 编号 + 可选的 :|xN 后缀（N 为 2~9）+ 可选的 [拍数@BPM]
 LINE_RE = re.compile(
@@ -66,14 +82,18 @@ def parse_timing(content):
     return int(beats_s), bpm, None
 
 
-def parse_tempo_map(text, total=None):
-    """解析临时变速方案文本，返回 ({演奏序号: BPM}, errors)。
+def parse_tempo_map(text, total=None, with_lines=False):
+    """解析临时变速方案文本，返回 (entries, errors)。
 
     每行格式为 “演奏序号=BPM”（空行忽略）：
     - 演奏序号按反复展开后的实际轮次计数，必须为正整数；
       提供 total（展开后的总小节数）时，序号不得超出该范围
     - BPM 必须为正整数
     - 序号重复时报错并指出首次出现的行
+
+    with_lines 为 False（默认）时 entries 为 {演奏序号: BPM}；
+    为 True 时 entries 为 {演奏序号: (BPM, 方案内行号)}，供需要按方案行
+    定位错误的调用方使用。
 
     errors 条目为 {"line": 方案内行号, "source": "临时变速", "message": 错误描述}，
     按行号排序。
@@ -126,7 +146,7 @@ def parse_tempo_map(text, total=None):
                 "message": f"演奏序号 {seq} 超出展开范围（共 {total} 小节）",
             })
             continue
-        entries[seq] = int(bpm_s)
+        entries[seq] = (int(bpm_s), lineno) if with_lines else int(bpm_s)
 
     return entries, errors
 
@@ -249,7 +269,12 @@ def _iter_source_measures(root):
 
 
 def _iter_playback(root, tempo_map=None):
-    """按实际演奏顺序产生 (小节节点, 演奏序号, 当前 BPM)。
+    """按实际演奏顺序产生 (小节节点, 演奏序号, 当前 BPM, 速度来源)。
+
+    速度来源标记当前 BPM 由何处生效，供错误定位：
+    - ("initial", None)       初始速度（尚未遇到任何速度标记）
+    - ("score", 源行号)        该小节行末的原谱 [拍数@BPM] 标记
+    - ("tempo", 方案内行号)     临时变速方案中对应的行（tempo_map 条目须含行号）
 
     展开与拍点查询共用同一速度轨迹，切换规则：
     - 初始速度 120 BPM
@@ -258,14 +283,19 @@ def _iter_playback(root, tempo_map=None):
     - 未标速度的小节沿用上一演奏小节的速度
     """
     bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
+    origin = ("initial", None)
     seq = 0  # 演奏序号
     for node in _iter_measures(root):
         seq += 1
         if tempo_map is not None and seq in tempo_map:
-            bpm = tempo_map[seq]  # 临时变速优先于原谱速度
+            entry = tempo_map[seq]
+            # with_lines=True 时条目为 (BPM, 方案内行号)
+            bpm, line = entry if isinstance(entry, tuple) else (entry, None)
+            origin = ("tempo", line)  # 临时变速优先于原谱速度
         elif node["bpm"] is not None:
             bpm = node["bpm"]
-        yield node, seq, bpm
+            origin = ("score", node["line"])
+        yield node, seq, bpm, origin
 
 
 def expand(root, limit=MAX_MEASURES, tempo_map=None):
@@ -281,7 +311,7 @@ def expand(root, limit=MAX_MEASURES, tempo_map=None):
     """
     rows = []
     elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
-    for node, seq, bpm in _iter_playback(root, tempo_map):
+    for node, seq, bpm, _origin in _iter_playback(root, tempo_map):
         duration = node["beats"] * 60000 / bpm
         rows.append({
             "seq": seq,
@@ -378,7 +408,7 @@ def beats_in_window(root, start_ms, end_ms,
     """
     beats = []
     elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
-    for node, seq, bpm in _iter_playback(root, tempo_map):
+    for node, seq, bpm, _origin in _iter_playback(root, tempo_map):
         beat_len = 60000 / bpm  # 每拍时长（毫秒）
         duration = node["beats"] * beat_len
         if elapsed >= end_ms:
@@ -406,3 +436,87 @@ def beats_in_window(root, start_ms, end_ms,
         # 整小节在窗口之前时按小节跨度跳过，不逐拍展开
         elapsed += duration
     return beats, None
+
+
+def _bpm_to_us_per_beat(bpm):
+    """BPM 换算为微秒/四分音符（60_000_000/BPM），四舍五入到最近整数。"""
+    return int(math.floor(60_000_000.0 / bpm + 0.5))
+
+
+def _encode_varlen(value):
+    """MIDI 可变长度量（delta time）编码。"""
+    out = [value & 0x7F]
+    value >>= 7
+    while value:
+        out.append(0x80 | (value & 0x7F))
+        value >>= 7
+    return bytes(reversed(out))
+
+
+def build_midi(root, measure_limit=MAX_MEASURES, beat_limit=MAX_TOTAL_BEATS,
+               tempo_map=None):
+    """按反复展开与临时变速优先级生成单轨节拍 MIDI（SMF 格式 0）。
+
+    时间轴直接按累计拍数定位（每拍为一个四分音符，480 ticks/拍），
+    不经过毫秒取整反推：
+    - 每小节首拍用第 10 通道 76 号音符，其余拍用 77 号，力度 100，
+      每个音符持续 120 ticks
+    - 在起点（tick 0）与实际发生变化的速度处写 Set Tempo 事件，
+      微秒/拍四舍五入取整；速度值无法用 MIDI 三字节正整数表示时报错
+    - 轨道结束（End of Track）位于 全曲拍数×480
+
+    沿用展开的 measure_limit（5000 小节），并以 beat_limit 限制全曲总拍数。
+
+    返回 (data, error)：成功时 data 为 .mid 字节、error 为 None；
+    失败时 data 为 None，error 为：
+    - {"kind": "measures", "node": 小节节点}              小节数超限
+    - {"kind": "beats", "node": 小节节点}                 总拍数超限
+    - {"kind": "tempo", "bpm", "origin": 速度来源}        速度无法表示
+      origin 形如 ("score"|"tempo"|"initial", 行号或 None)
+    """
+    events = []  # (tick, 顺序, 字节)
+    total_beats = 0
+    measures = 0
+    cur_bpm = None
+
+    for node, _seq, bpm, origin in _iter_playback(root, tempo_map):
+        measures += 1
+        if measures > measure_limit:
+            return None, {"kind": "measures", "node": node}
+
+        if bpm != cur_bpm:
+            us = _bpm_to_us_per_beat(bpm)
+            if not TEMPO_US_MIN <= us <= TEMPO_US_MAX:
+                return None, {"kind": "tempo", "bpm": bpm, "origin": origin}
+            events.append((
+                total_beats * MIDI_TICKS_PER_BEAT, 0,
+                b"\xFF\x51\x03" + struct.pack(">I", us)[1:],
+            ))
+            cur_bpm = bpm
+
+        for k in range(node["beats"]):
+            tick = total_beats * MIDI_TICKS_PER_BEAT
+            note = MIDI_NOTE_FIRST if k == 0 else MIDI_NOTE_OTHER
+            events.append((tick, 1, bytes([0x90 | MIDI_CHANNEL, note, MIDI_VELOCITY])))
+            events.append((
+                tick + MIDI_NOTE_TICKS, 2,
+                bytes([0x80 | MIDI_CHANNEL, note, 0]),
+            ))
+            total_beats += 1
+            if total_beats > beat_limit:
+                return None, {"kind": "beats", "node": node}
+
+    end_tick = total_beats * MIDI_TICKS_PER_BEAT
+    events.append((end_tick, 0, b"\xFF\x2F\x00"))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    body = bytearray()
+    at = 0
+    for tick, _order, raw in events:
+        body += _encode_varlen(tick - at)
+        body += raw
+        at = tick
+
+    header = b"MThd" + struct.pack(">IHHH", 6, 0, 1, MIDI_TICKS_PER_BEAT)
+    track = b"MTrk" + struct.pack(">I", len(body)) + bytes(body)
+    return header + track, None

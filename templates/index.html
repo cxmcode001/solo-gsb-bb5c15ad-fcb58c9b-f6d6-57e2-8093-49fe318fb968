@@ -68,6 +68,10 @@
     行末可附 <code>[拍数@BPM]</code> 或 <code>[拍数]</code>：拍数默认 4，初始速度
     120 BPM，未标速度的小节沿用上一演奏小节的速度；起止时间单位为毫秒。
     展开结果超过 5000 小节时将停止并指出导致超限的源行。
+    点“下载节拍 MIDI”可按当前乐谱与临时变速方案导出节拍 <code>.mid</code>
+    （单轨 SMF 格式 0、480 ticks/拍，首拍与其余拍分别为第 10 通道 76、77 号音符），
+    供音乐软件离线使用；全曲超过 5000 小节或 5000 拍、或速度超出 MIDI 可表示范围时
+    不会下载，改为显示错误。
   </p>
   <textarea id="input" rows="12" spellcheck="false"
     placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
@@ -84,6 +88,7 @@
     <button id="exampleBtn">填入示例</button>
     <button id="clearBtn">清空</button>
     <button id="csvBtn" disabled>下载 CSV</button>
+    <button id="midiBtn">下载节拍 MIDI</button>
   </div>
   <div id="errors"></div>
   <p id="summary"></p>
@@ -164,6 +169,7 @@ $("exampleBtn").addEventListener("click", () => {
   doExpand();
 });
 $("csvBtn").addEventListener("click", downloadCsv);
+$("midiBtn").addEventListener("click", downloadMidi);
 $("beatsBtn").addEventListener("click", doBeatQuery);
 for (const id of ["startMs", "endMs"]) {
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doBeatQuery(); });
@@ -555,6 +561,44 @@ function downloadCsv() {
   a.download = "expanded_measures.csv";
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+async function downloadMidi() {
+  const btn = $("midiBtn");
+  btn.disabled = true;
+  btn.textContent = "导出中…";
+  $("errors").innerHTML = "";
+  try {
+    // 服务端先做与展开一致的校验（含临时变速、5000 小节/5000 拍、MIDI 速度范围），
+    // 仅在成功时返回 .mid 二进制；校验失败返回 JSON 错误，不创建任何下载
+    const resp = await fetch("/api/midi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value, tempo: $("tempo").value }),
+    });
+    if (!resp.ok) {
+      let data = null;
+      try { data = await resp.json(); } catch (e) { data = null; }
+      showErrors((data && data.errors) ||
+        [{ line: null, message: `MIDI 导出失败（HTTP ${resp.status}）` }]);
+      return;
+    }
+    const blob = await resp.blob();
+    if (blob.size === 0) {
+      showErrors([{ line: null, message: "MIDI 导出失败：返回内容为空" }]);
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "metronome.mid";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {
+    showErrors([{ line: null, message: "MIDI 导出请求失败：" + e }]);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "下载节拍 MIDI";
+  }
 }
 </script>
 </body>

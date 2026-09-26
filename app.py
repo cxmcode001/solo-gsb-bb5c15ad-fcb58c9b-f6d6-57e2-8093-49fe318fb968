@@ -3,11 +3,11 @@
 import math
 import os
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from repeats import (
-    MAX_BEATS, MAX_MEASURES, beats_in_window, expand, match_segments, parse,
-    parse_tempo_map, source_range_pattern,
+    MAX_BEATS, MAX_MEASURES, MAX_TOTAL_BEATS, beats_in_window, build_midi,
+    expand, match_segments, parse, parse_tempo_map, source_range_pattern,
 )
 
 app = Flask(__name__)
@@ -71,11 +71,12 @@ def _has_tempo(data):
     return tempo is not None and (not isinstance(tempo, str) or bool(tempo.strip()))
 
 
-def _parse_tempo(data, total):
+def _parse_tempo(data, total, with_lines=False):
     """从请求数据解析临时变速方案，返回 (tempo_map, errors)。
 
     total 为展开后的总小节数，用于校验序号范围；
     未提供方案时 tempo_map 为 None 且 errors 为空。
+    with_lines 为 True 时 tempo_map 条目带方案内行号（MIDI 导出错误定位用）。
     """
     tempo_text = data.get("tempo")
     if tempo_text is None:
@@ -84,7 +85,8 @@ def _parse_tempo(data, total):
         return None, [{"line": None, "message": "临时变速方案必须是多行文本"}]
     if not tempo_text.strip():
         return None, []
-    tempo_map, errors = parse_tempo_map(tempo_text, total)
+    tempo_map, errors = parse_tempo_map(
+        tempo_text, total, with_lines=with_lines)
     if errors:
         return None, errors
     return tempo_map, []
@@ -222,6 +224,81 @@ def api_segments():
         "pattern": pattern,
         "segments": segments,
     })
+
+
+def _midi_error_entry(error):
+    """将 build_midi 的失败描述转换为统一的错误条目。"""
+    kind = error["kind"]
+    if kind == "measures":
+        return _measure_overflow_error(error["node"])
+    if kind == "beats":
+        node = error["node"]
+        return {
+            "line": node["line"],
+            "message": (
+                f"全曲总拍数超过 {MAX_TOTAL_BEATS} 拍上限，"
+                f"在第 {node['line']} 行（小节 {node['num']}）处停止"
+            ),
+        }
+    # kind == "tempo"：微秒/拍无法用 MIDI 三字节正整数（1~16777215）表示。
+    # 按四舍五入换算，约需 4~120000000 BPM 才能表示
+    bpm = error["bpm"]
+    source, line = error["origin"]
+    if source == "tempo":
+        detail = f"临时速度 {bpm} BPM"
+        return {
+            "line": line,
+            "source": "临时变速",
+            "message": f"{detail} 超出 MIDI 速度可表示范围（约 4~120000000 BPM），无法导出 MIDI",
+        }
+    if source == "score":
+        detail = f"标注的速度 {bpm} BPM"
+        return {
+            "line": line,
+            "message": f"{detail} 超出 MIDI 速度可表示范围（约 4~120000000 BPM），无法导出 MIDI",
+        }
+    return {
+        "line": None,
+        "message": f"初始速度 {bpm} BPM 超出 MIDI 速度可表示范围（约 4~120000000 BPM），无法导出 MIDI",
+    }
+
+
+@app.post("/api/midi")
+def api_midi():
+    data = request.get_json(silent=True) or {}
+    text = data.get("input", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({
+            "ok": False,
+            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
+        }), 400
+
+    root, errors = parse(text)
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
+
+    # 与展开接口一致：先展开一次取得总小节数，校验临时变速序号范围
+    rows, overflow = expand(root)
+    if overflow is not None:
+        return jsonify({
+            "ok": False,
+            "overflow": True,
+            "errors": [_measure_overflow_error(overflow)],
+        }), 400
+    tempo_map, tempo_errors = _parse_tempo(data, len(rows), with_lines=True)
+    if tempo_errors:
+        return jsonify({"ok": False, "errors": tempo_errors}), 400
+
+    midi, error = build_midi(root, tempo_map=tempo_map)
+    if error is not None:
+        return jsonify({
+            "ok": False,
+            "errors": [_midi_error_entry(error)],
+        }), 400
+
+    resp = Response(midi, mimetype="audio/midi")
+    resp.headers["Content-Disposition"] = "attachment; filename=metronome.mid"
+    return resp
 
 
 if __name__ == "__main__":

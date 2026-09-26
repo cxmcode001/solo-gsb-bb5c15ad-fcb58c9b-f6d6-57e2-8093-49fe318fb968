@@ -8,16 +8,19 @@
 可另附多行“演奏序号=BPM”的临时变速方案，展开、节拍点查询与片段定位共用同一速度轨迹。
 页面内置实时节拍器：以当前乐谱和临时变速方案从头播放节拍，
 首拍高音、其余拍低音，播放到曲终自动停止。
+还可一键导出节拍 MIDI（`.mid` 附件，单轨 SMF 格式 0），
+每小节首拍与其余拍分别使用第 10 通道的 76、77 号音符，供音乐软件离线使用。
 
 ## 启动
 
-一条命令完成构建并启动：
+一条命令完成构建并启动（构建镜像并安装 `requirements.txt` 中的依赖，随后启动应用）：
 
 ```bash
 docker compose up --build
 ```
 
-容器启动时会自动安装依赖（`pip install -r requirements.txt`）并启动应用。
+容器启动时会自动安装依赖（`pip install -r requirements.txt`）并启动应用，无需手动初始化。
+本地不使用 Docker 时同样是一条命令启动（见文末“本地开发”）。
 
 ## 访问
 
@@ -26,6 +29,17 @@ docker compose up --build
   - `POST http://localhost:5000/api/expand`，请求体 `{"input": "小节编号逐行文本", "tempo": "可选的临时变速方案"}`
   - `POST http://localhost:5000/api/beats`，请求体 `{"input": "...", "start_ms": 0, "end_ms": 1000, "tempo": "可选的临时变速方案"}`
   - `POST http://localhost:5000/api/segments`，请求体 `{"input": "...", "start_num": 3, "end_num": 7, "tempo": "可选的临时变速方案"}`
+  - `POST http://localhost:5000/api/midi`，请求体同上只取 `input`、`tempo` 两个字段，
+    成功时返回 `metronome.mid` 文件附件，校验失败时返回 400 与 JSON 错误（见下文“节拍 MIDI 导出”）
+
+MIDI 导出示例（`curl`，`-OJ` 按服务端文件名保存附件）：
+
+```bash
+curl -X POST http://localhost:5000/api/midi \
+  -H "Content-Type: application/json" \
+  -d '{"input": "1[4@120]\n2\n|:3\n4:|x2", "tempo": "3=90"}' \
+  -OJ
+```
 
 `tempo` 为可选字段：多行文本，每行一条 `演奏序号=BPM`（见下文“临时变速方案”）；
 省略或留空时按原谱速度计算。
@@ -129,6 +143,27 @@ docker compose up --build
 - 点击“停止”、修改乐谱或临时变速方案时，取消尚未发声的拍点，过期请求的响应不再排程
 - 播放到曲终自动停止；接口报错显示在页面上
 
+## 节拍 MIDI 导出
+
+点击页面上的“下载节拍 MIDI”，或调用 `POST /api/midi`（请求体仅需 `input`
+与可选的 `tempo`，与展开接口相同），即可按当前输入生成节拍 `.mid` 附件
+（`metronome.mid`，MIME `audio/midi`），导入音乐软件后可离线跟随。
+
+- 输出为单轨 SMF 格式 0，分辨率 480 ticks/拍；每拍作为一个四分音符，
+  事件位置按**累计拍数 × 480** 直接定位，不经过取整毫秒反推
+- 音符写在第 10 通道（打击乐通道）：每小节首拍用 76 号音符，其余拍用 77 号，
+  力度 100，每个音符持续 120 ticks
+- 在起点（tick 0）及每一处实际发生变化的速度处写入 Set Tempo 事件；
+  微秒/拍按 `60000000 / BPM` 四舍五入取整，相同速度不重复写事件
+- 速度切换复用反复展开与临时变速优先级（临时变速优先于原谱显式速度，
+  未标速小节沿用上一速度）
+- 轨道结束（End of Track）位置为全曲拍数 × 480
+- 沿用输入错误与 5000 小节限制，并额外限制全曲总拍数不超过 5000；
+  速度换算后的微秒/拍无法用 MIDI 三字节正整数（1~16777215，约合 4~120000000 BPM）
+  表示时返回可读错误并注明来源（原谱行或“临时变速”方案行）
+- 任何校验失败都返回 HTTP 400 与统一结构的 JSON 错误，页面只显示错误而不下载，
+  因此不会得到残缺文件
+
 ## 校验规则
 
 - 格式错误：定位到具体输入行
@@ -142,6 +177,9 @@ docker compose up --build
   序号超出展开范围时指出展开后的总小节数；方案错误统一标注“临时变速”及方案内行号
 - 片段定位的起止小节编号必须是非负整数且都存在于源谱；
   起点在源谱输入顺序中的位置不得晚于终点
+- MIDI 导出沿用以上全部输入与临时变速校验及 5000 小节限制；
+  全曲总拍数超过 5000 拍时停止并指出对应源行；速度（初始、原谱或临时变速）
+  超出 MIDI 三字节速度可表示范围时，返回可读错误并注明来源行，不生成文件
 
 ## 本地开发（不使用 Docker）
 
@@ -153,10 +191,10 @@ python app.py
 ## 项目结构
 
 ```
-app.py               Flask 应用与 API
-repeats.py           反复段解析、校验、展开、排练时间轴、节拍点查询与片段定位
+app.py               Flask 应用与 API（展开、拍点查询、片段定位、MIDI 导出）
+repeats.py           反复段解析、校验、展开、排练时间轴、节拍点查询、片段定位与 MIDI 生成
 templates/index.html 前端页面（原生 HTML/JavaScript）
-requirements.txt     Python 依赖
+requirements.txt     Python 依赖（MIDI 生成仅用标准库，无额外依赖）
 Dockerfile           镜像构建（依赖随容器启动安装）
 docker-compose.yml   Compose 编排
 ```
