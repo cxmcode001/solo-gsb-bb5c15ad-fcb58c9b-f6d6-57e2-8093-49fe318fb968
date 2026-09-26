@@ -21,7 +21,7 @@ import re
 # 展开小节数上限
 MAX_MEASURES = 5000
 
-# 时间窗内拍点数上限
+# 拍点数上限（时间窗内拍点、MIDI 导出全曲拍数）
 MAX_BEATS = 5000
 
 # 默认拍数与初始速度
@@ -358,6 +358,38 @@ def match_segments(rows, pattern):
             progress = 0
             first = None
     return segments
+
+
+def beat_timeline(root, tempo_map=None, measure_limit=MAX_MEASURES, beat_limit=MAX_BEATS):
+    """按累计拍数生成全曲节拍与速度事件（供 MIDI 导出）。
+
+    速度轨迹与展开、拍点查询一致（见 _iter_playback）：临时变速优先于原谱速度。
+    事件位置完全由累计拍数确定（拍序号从 0 开始），不经过毫秒换算或取整。
+
+    返回 (timeline, overflow)：
+    - timeline 为 {"beats": [{"index": 拍序号, "first": 是否首拍}, ...],
+                   "tempos": [{"index": 拍序号, "bpm": BPM, "seq": 演奏序号}, ...],
+                   "total_beats": 全曲拍数}；
+      tempos 含起点及每次有效速度变化（BPM 与上一演奏小节不同的首个拍）
+    - overflow 为 None，或 {"kind": "measures" | "beats",
+                            "node": 导致停止的小节节点}
+    """
+    beats = []
+    tempos = []
+    index = 0  # 累计拍序号
+    prev_bpm = None
+    for node, seq, bpm in _iter_playback(root, tempo_map):
+        if seq > measure_limit:
+            return None, {"kind": "measures", "node": node}
+        if bpm != prev_bpm:
+            tempos.append({"index": index, "bpm": bpm, "seq": seq})
+            prev_bpm = bpm
+        for k in range(node["beats"]):
+            beats.append({"index": index, "first": k == 0})
+            index += 1
+            if len(beats) > beat_limit:
+                return None, {"kind": "beats", "node": node}
+    return {"beats": beats, "tempos": tempos, "total_beats": index}, None
 
 
 def beats_in_window(root, start_ms, end_ms,

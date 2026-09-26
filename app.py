@@ -2,12 +2,14 @@
 
 import math
 import os
+from io import BytesIO
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
+from midi import encode_smf
 from repeats import (
-    MAX_BEATS, MAX_MEASURES, beats_in_window, expand, match_segments, parse,
-    parse_tempo_map, source_range_pattern,
+    MAX_BEATS, MAX_MEASURES, beat_timeline, beats_in_window, expand,
+    match_segments, parse, parse_tempo_map, source_range_pattern,
 )
 
 app = Flask(__name__)
@@ -222,6 +224,59 @@ def api_segments():
         "pattern": pattern,
         "segments": segments,
     })
+
+
+@app.post("/api/midi")
+def api_midi():
+    data = request.get_json(silent=True) or {}
+    text = data.get("input", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({
+            "ok": False,
+            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
+        })
+
+    root, errors = parse(text)
+    if errors:
+        return jsonify({"ok": False, "errors": errors})
+
+    # 与展开接口一致：先展开一次取得总小节数以校验临时变速序号范围
+    rows, overflow = expand(root)
+    if overflow is not None:
+        return jsonify({
+            "ok": False,
+            "overflow": True,
+            "errors": [_measure_overflow_error(overflow)],
+        })
+    tempo_map, tempo_errors = _parse_tempo(data, len(rows))
+    if tempo_errors:
+        return jsonify({"ok": False, "errors": tempo_errors})
+
+    timeline, overflow = beat_timeline(root, tempo_map=tempo_map)
+    if overflow is not None:
+        node = overflow["node"]
+        if overflow["kind"] == "measures":
+            error = _measure_overflow_error(node)
+        else:
+            error = {
+                "line": node["line"],
+                "message": (
+                    f"全曲拍数超过 {MAX_BEATS} 上限，"
+                    f"在第 {node['line']} 行（小节 {node['num']}）处停止"
+                ),
+            }
+        return jsonify({"ok": False, "overflow": True, "errors": [error]})
+
+    content, err = encode_smf(timeline)
+    if err is not None:
+        return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+
+    return send_file(
+        BytesIO(content),
+        mimetype="audio/midi",
+        as_attachment=True,
+        download_name="beats.mid",
+    )
 
 
 if __name__ == "__main__":

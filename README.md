@@ -8,6 +8,7 @@
 可另附多行“演奏序号=BPM”的临时变速方案，展开、节拍点查询与片段定位共用同一速度轨迹。
 页面内置实时节拍器：以当前乐谱和临时变速方案从头播放节拍，
 首拍高音、其余拍低音，播放到曲终自动停止。
+还可将当前乐谱的节拍导出为单轨 MIDI 文件（SMF 格式 0），供音乐软件离线使用。
 
 ## 启动
 
@@ -26,6 +27,8 @@ docker compose up --build
   - `POST http://localhost:5000/api/expand`，请求体 `{"input": "小节编号逐行文本", "tempo": "可选的临时变速方案"}`
   - `POST http://localhost:5000/api/beats`，请求体 `{"input": "...", "start_ms": 0, "end_ms": 1000, "tempo": "可选的临时变速方案"}`
   - `POST http://localhost:5000/api/segments`，请求体 `{"input": "...", "start_num": 3, "end_num": 7, "tempo": "可选的临时变速方案"}`
+  - `POST http://localhost:5000/api/midi`，请求体 `{"input": "...", "tempo": "可选的临时变速方案"}`，
+    成功时返回 `audio/midi` 类型的 `.mid` 附件，校验失败时返回 JSON 错误
 
 `tempo` 为可选字段：多行文本，每行一条 `演奏序号=BPM`（见下文“临时变速方案”）；
 省略或留空时按原谱速度计算。
@@ -129,6 +132,29 @@ docker compose up --build
 - 点击“停止”、修改乐谱或临时变速方案时，取消尚未发声的拍点，过期请求的响应不再排程
 - 播放到曲终自动停止；接口报错显示在页面上
 
+## 节拍 MIDI 导出
+
+点击“下载节拍MIDI”后，页面以当前乐谱和临时变速方案请求 `POST /api/midi`，
+将全曲节拍保存为 `beats.mid`，供音乐软件离线使用：
+
+- 单轨 SMF 格式 0，480 ticks/拍；每拍一个四分音符，事件按累计拍数定位
+  （拍序号 × 480），不经毫秒换算
+- 每小节首拍与其余拍分别为第 10 通道的 76、77 号音符，力度 100，持续 120 ticks
+- 起点及有效速度变化处写入速度事件，微秒/拍按四舍五入取整；
+  轨道结束位置为全曲拍数 × 480
+- 沿用输入校验与 5000 小节上限，另限制全曲 5000 拍；
+  速度换算的微秒/拍无法用 MIDI 三字节正整数表示（1~16777215）时返回可读错误，
+  页面不下载残缺文件
+
+导出接口示例：
+
+```bash
+curl -X POST http://localhost:5000/api/midi \
+  -H "Content-Type: application/json" \
+  -d '{"input": "1[4@120]\n2", "tempo": ""}' \
+  -o beats.mid
+```
+
 ## 校验规则
 
 - 格式错误：定位到具体输入行
@@ -142,6 +168,8 @@ docker compose up --build
   序号超出展开范围时指出展开后的总小节数；方案错误统一标注“临时变速”及方案内行号
 - 片段定位的起止小节编号必须是非负整数且都存在于源谱；
   起点在源谱输入顺序中的位置不得晚于终点
+- MIDI 导出另限制全曲 5000 拍；速度换算的微秒/拍须为 MIDI 三字节正整数
+  （1~16777215），否则返回错误且不生成文件
 
 ## 本地开发（不使用 Docker）
 
@@ -154,7 +182,8 @@ python app.py
 
 ```
 app.py               Flask 应用与 API
-repeats.py           反复段解析、校验、展开、排练时间轴、节拍点查询与片段定位
+repeats.py           反复段解析、校验、展开、排练时间轴、节拍点查询、片段定位与节拍时间轴
+midi.py              单轨 SMF 格式 0 编码（MIDI 导出）
 templates/index.html 前端页面（原生 HTML/JavaScript）
 requirements.txt     Python 依赖
 Dockerfile           镜像构建（依赖随容器启动安装）

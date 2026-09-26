@@ -106,6 +106,18 @@
     <span id="metroStatus"></span>
   </div>
 
+  <h2>节拍 MIDI 导出</h2>
+  <p class="hint">
+    按当前乐谱与临时变速方案生成单轨 MIDI 文件（SMF 格式 0，480 ticks/拍），供音乐软件离线使用：
+    每拍一个四分音符，每小节首拍与其余拍分别为第 10 通道的 76、77 号音符，力度 100，持续 120 ticks；
+    事件按累计拍数定位，起点与有效速度变化处写入速度事件，轨道结束于全曲拍数 × 480。
+    展开超过 5000 小节、全曲拍数超过 5000，或速度换算的微秒/拍无法用 MIDI 三字节正整数表示时，
+    返回错误且不下载文件。
+  </p>
+  <div class="toolbar">
+    <button id="midiBtn" class="primary">下载节拍MIDI</button>
+  </div>
+
   <h2>节拍点查询</h2>
   <p class="hint">
     输入起止毫秒，列出时间窗内每一拍的时间、演奏序号、原小节编号、拍序与首拍标记。
@@ -164,6 +176,7 @@ $("exampleBtn").addEventListener("click", () => {
   doExpand();
 });
 $("csvBtn").addEventListener("click", downloadCsv);
+$("midiBtn").addEventListener("click", downloadMidi);
 $("beatsBtn").addEventListener("click", doBeatQuery);
 for (const id of ["startMs", "endMs"]) {
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doBeatQuery(); });
@@ -553,6 +566,38 @@ function downloadCsv() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "expanded_measures.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function downloadMidi() {
+  $("errors").innerHTML = "";
+  let resp;
+  try {
+    resp = await fetch("/api/midi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value, tempo: $("tempo").value }),
+    });
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  // 校验失败时服务端返回 JSON 错误而非 MIDI 文件，此时不下载任何文件
+  const type = resp.headers.get("Content-Type") || "";
+  if (!type.includes("audio/midi")) {
+    let errors = [{ line: null, message: `导出 MIDI 失败（HTTP ${resp.status}）` }];
+    try {
+      const data = await resp.json();
+      if (data && data.errors && data.errors.length) errors = data.errors;
+    } catch (e) { /* 保留默认错误描述 */ }
+    showErrors(errors);
+    return;
+  }
+  const blob = await resp.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "beats.mid";
   a.click();
   URL.revokeObjectURL(a.href);
 }
